@@ -190,7 +190,10 @@ class ResponsesRequest(BaseModel):
         top_p: Top-p sampling
         max_output_tokens: Maximum tokens in response
         stream: Whether to stream the response
-        previous_response_id: ID of previous response (not supported - stateless gateway)
+        previous_response_id: ID of a previous response to resume from. When
+            set, the gateway looks up the stored canonical conversation
+            state and prepends it to ``input`` before building the Kiro
+            payload. On cache miss, the request is processed as-is.
         store: Whether to store the response (ignored - stateless gateway)
         metadata: Request metadata (ignored)
         truncation: Truncation strategy (ignored)

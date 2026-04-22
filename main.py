@@ -73,6 +73,8 @@ from kiro.config import (
     HIDDEN_FROM_LIST,
     FALLBACK_MODELS,
     VPN_PROXY_URL,
+    RESPONSE_STORE_MAX_ENTRIES,
+    RESPONSE_STORE_TTL_SECONDS,
     _warn_timeout_configuration,
 )
 from kiro.auth import KiroAuthManager
@@ -420,6 +422,21 @@ async def lifespan(app: FastAPI):
     from kiro.token_stats import TokenStats
     app.state.token_stats = TokenStats()
     app.state.token_stats.cleanup()
+
+    # Initialize Responses API state store (previous_response_id resume).
+    # Codex's delta protocol sends only new input items on turn N>=2; the
+    # store holds the canonical conversation snapshot so we can rebuild
+    # the full prompt before calling Kiro.
+    from kiro.response_store import ResponseStore
+    app.state.response_store = ResponseStore(
+        max_entries=RESPONSE_STORE_MAX_ENTRIES,
+        ttl_seconds=RESPONSE_STORE_TTL_SECONDS,
+    )
+    logger.info(
+        f"Response store initialized "
+        f"(max_entries={RESPONSE_STORE_MAX_ENTRIES}, "
+        f"ttl_seconds={RESPONSE_STORE_TTL_SECONDS})"
+    )
 
     yield
 

@@ -475,6 +475,7 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 
@@ -497,6 +498,30 @@ AUTO_TRIM_PAYLOAD: bool = os.getenv("AUTO_TRIM_PAYLOAD", "false").lower() in ("t
 #
 # Note: Native Anthropic server-side tools (Path A) work ALWAYS, regardless of this setting
 WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# ==================================================================================================
+# Responses API State Store (previous_response_id resume)
+# ==================================================================================================
+
+# Codex's Responses API uses a delta protocol: on turn N>=2 it only sends
+# the new input items and a previous_response_id. Without a store on the
+# gateway side, Kiro would see the deltas in isolation and the model would
+# lose the original question. The in-memory store bridges that gap.
+#
+# RESPONSE_STORE_MAX_ENTRIES: maximum number of turns to retain. LRU
+#   eviction kicks in beyond this. 512 is enough for several long
+#   interleaved codex sessions; bump it if you run many parallel clients.
+#
+# RESPONSE_STORE_TTL_SECONDS: how long a stored turn stays valid. One
+#   hour is a safe default — long enough for a codex session to idle
+#   mid-task, short enough to keep memory bounded. Set to 0 to disable
+#   TTL expiry (not recommended).
+RESPONSE_STORE_MAX_ENTRIES: int = int(
+    os.getenv("RESPONSE_STORE_MAX_ENTRIES", "512")
+)
+RESPONSE_STORE_TTL_SECONDS: float = float(
+    os.getenv("RESPONSE_STORE_TTL_SECONDS", "3600")
+)
 
 # ==================================================================================================
 # Application Version

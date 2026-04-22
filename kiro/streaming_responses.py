@@ -42,7 +42,7 @@ Responses API streaming events (in order):
 import json
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Awaitable, AsyncGenerator, Callable, List, Optional
 
 import httpx
 from loguru import logger
@@ -137,6 +137,7 @@ async def stream_kiro_to_responses(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     usage_collector=None,
+    on_complete: Optional[Callable[[str, List[dict]], Awaitable[None]]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Responses API SSE format.
@@ -152,6 +153,11 @@ async def stream_kiro_to_responses(
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        on_complete: Optional async callback invoked with
+            ``(response_id, final_output)`` right before the terminal
+            ``response.completed`` SSE event is yielded. Used by the
+            route handler to persist the turn into the response store
+            for codex's ``previous_response_id`` resume flow.
 
     Yields:
         Strings in SSE format for Responses API streaming
@@ -514,6 +520,15 @@ async def stream_kiro_to_responses(
         )
         if usage_collector:
             usage_collector.set(model, usage["input_tokens"], usage["output_tokens"])
+        if on_complete is not None:
+            # Persist BEFORE emitting response.completed so codex never
+            # sees a response id it can't resume.
+            try:
+                await on_complete(response_id, list(final_output))
+            except Exception as store_err:
+                logger.warning(
+                    f"[Responses stream] on_complete callback failed: {store_err}"
+                )
         yield _sse_event("response.completed", completed_response)
         logger.debug("[Responses stream] response.completed sent successfully")
 
@@ -598,6 +613,7 @@ async def stream_kiro_to_responses_ws(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     usage_collector=None,
+    on_complete: Optional[Callable[[str, List[dict]], Awaitable[None]]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Responses API WebSocket format.
@@ -614,6 +630,11 @@ async def stream_kiro_to_responses_ws(
         first_token_timeout: First token wait timeout (seconds)
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
+        on_complete: Optional async callback invoked with
+            ``(response_id, final_output)`` right before the terminal
+            ``response.completed`` WS frame. Mirrors the SSE variant so
+            the WebSocket handler can persist turns for codex's
+            ``previous_response_id`` resume.
 
     Yields:
         JSON strings for WebSocket text messages
@@ -907,6 +928,13 @@ async def stream_kiro_to_responses_ws(
         }
         if usage_collector:
             usage_collector.set(model, usage["input_tokens"], usage["output_tokens"])
+        if on_complete is not None:
+            try:
+                await on_complete(response_id, list(final_output))
+            except Exception as store_err:
+                logger.warning(
+                    f"[Responses WS] on_complete callback failed: {store_err}"
+                )
         yield _ws_event("response.completed", completed_response)
         logger.debug("[Responses WS] response.completed sent")
 

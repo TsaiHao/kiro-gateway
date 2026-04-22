@@ -137,6 +137,86 @@ def _extract_message_content(content: Any) -> str:
     return str(content) if content else ""
 
 
+def _normalize_tool_output(output: Any) -> str:
+    """
+    Normalizes a ``function_call_output.output`` value to a string.
+
+    Codex's ``FunctionCallOutputPayload`` serializes as either a plain string
+    or a list of content-item blocks (``[{"type": "output_text", "text": "..."}]``)
+    for large or structured tool outputs. Downstream code stringifies this blindly
+    when it's not a string, which produces Python list-repr garbage
+    (``[{'type': 'output_text', 'text': '...'}]``) as the tool result the model sees.
+
+    This helper extracts the textual payload regardless of shape:
+
+    - String → returned as-is.
+    - List of blocks → concatenates the ``text`` field of each known block
+      (``output_text``/``text``/``input_text``). Unknown blocks are serialized
+      as JSON so information isn't silently lost.
+    - Dict with a ``text`` field → that text.
+    - Empty/None → ``"(empty result)"`` (preserves existing fallback).
+
+    Args:
+        output: Raw output value from a Responses API ``function_call_output`` item.
+
+    Returns:
+        A plain string suitable for ``UnifiedMessage.tool_results[*].content``.
+
+    Examples:
+        >>> _normalize_tool_output("72F, sunny")
+        '72F, sunny'
+        >>> _normalize_tool_output([{"type": "output_text", "text": "hello"}])
+        'hello'
+        >>> _normalize_tool_output("")
+        '(empty result)'
+    """
+    if output is None:
+        return "(empty result)"
+
+    if isinstance(output, str):
+        return output or "(empty result)"
+
+    if isinstance(output, list):
+        parts: List[str] = []
+        for block in output:
+            if isinstance(block, dict):
+                block_type = block.get("type", "")
+                if block_type in ("output_text", "text", "input_text"):
+                    parts.append(block.get("text", ""))
+                elif "text" in block and isinstance(block["text"], str):
+                    # Tolerate untyped blocks that still carry a text field.
+                    parts.append(block["text"])
+                else:
+                    # Unknown block shape — JSON-dump so the data survives
+                    # instead of getting lost to Python repr downstream.
+                    try:
+                        parts.append(json.dumps(block, ensure_ascii=False))
+                    except (TypeError, ValueError):
+                        parts.append(str(block))
+            elif hasattr(block, "text"):
+                parts.append(getattr(block, "text", "") or "")
+            elif isinstance(block, str):
+                parts.append(block)
+            else:
+                try:
+                    parts.append(json.dumps(block, ensure_ascii=False))
+                except (TypeError, ValueError):
+                    parts.append(str(block))
+        joined = "".join(parts)
+        return joined or "(empty result)"
+
+    if isinstance(output, dict):
+        text = output.get("text")
+        if isinstance(text, str) and text:
+            return text
+        try:
+            return json.dumps(output, ensure_ascii=False) or "(empty result)"
+        except (TypeError, ValueError):
+            return str(output) or "(empty result)"
+
+    return str(output) or "(empty result)"
+
+
 def convert_responses_input_to_unified(
     request: ResponsesRequest,
 ) -> Tuple[str, List[UnifiedMessage]]:
@@ -236,17 +316,37 @@ def convert_responses_input_to_unified(
                 )
 
         elif item_type == "function_call_output":
-            # Tool result — collect and attach to next user message
+            # Tool result — collect and attach to next user message.
+            # NOTE: codex may send ``output`` as either a plain string or a list
+            # of content-item blocks (see codex-rs/protocol/src/models.rs
+            # FunctionCallOutputPayload). Normalize both into a plain string so
+            # that nothing downstream ends up stringifying a Python list into
+            # "[{'type': 'output_text', ...}]" and feeding that to the model.
             call_id = item_dict.get("call_id", "")
             output = item_dict.get("output", "")
+            normalized_output = _normalize_tool_output(output)
 
             pending_tool_results.append(
                 {
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": output or "(empty result)",
+                    "content": normalized_output,
                 }
             )
+
+        elif item_type in ("reasoning", "reasoning_text", "reasoning_summary_text"):
+            # Codex replays the prior turn's output items back as the next turn's
+            # input, including any ``reasoning`` items we emitted during streaming.
+            # The model's own prior reasoning is ephemeral state; replaying it as
+            # a user-visible message confuses the model and has been observed to
+            # make it "forget the question" after a couple of tool rounds.
+            # Drop silently. The assistant message / tool_call items around it
+            # still carry the actionable conversation state.
+            logger.debug(
+                f"Dropping Responses API input item type '{item_type}' "
+                f"(id={item_dict.get('id', '')!r}) — reasoning items are not replayed"
+            )
+            continue
 
         else:
             # Unknown item type — try to extract as message

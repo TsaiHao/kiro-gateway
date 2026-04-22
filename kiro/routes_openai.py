@@ -29,6 +29,7 @@ Contains all API endpoints:
 
 import json
 from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -49,6 +50,11 @@ from kiro.cache import ModelInfoCache
 from kiro.model_resolver import ModelResolver
 from kiro.converters_openai import build_kiro_payload
 from kiro.converters_responses import build_kiro_payload as build_kiro_payload_responses
+from kiro.response_store import (
+    ResponseStore,
+    StoredTurn,
+    _sanitize_stored_input_for_replay,
+)
 from kiro.streaming_openai import (
     stream_kiro_to_openai,
     collect_stream_response,
@@ -105,6 +111,151 @@ async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
 
 # --- Router ---
 router = APIRouter()
+
+
+async def _resume_from_prev_response(
+    request_data,
+    response_store: Optional[ResponseStore],
+) -> Tuple[Optional[list], Optional[str]]:
+    """
+    Look up a prior turn by ``previous_response_id`` and merge it in.
+
+    Codex's delta protocol sends only new input items on turn N>=2
+    (typically ``function_call_output`` items) plus the prior turn's
+    response id. This helper fetches the stored canonical conversation
+    and returns a merged ``input`` list ready to replace
+    ``request_data.input``.
+
+    The stored ``input_items`` are sanitized to drop reasoning-type
+    items before replay — reasoning is a server-side artifact and
+    replaying it confuses the model.
+
+    Args:
+        request_data: Parsed ``ResponsesRequest``.
+        response_store: App-wide store (may be ``None`` in tests).
+
+    Returns:
+        Tuple of ``(merged_input, merged_instructions)``. Either may be
+        ``None`` when no merge is needed (no prev id, cache miss, or
+        store disabled). The caller patches ``request_data`` with the
+        non-None values.
+    """
+    prev_id = getattr(request_data, "previous_response_id", None)
+    if not prev_id or response_store is None:
+        return None, None
+
+    stored = await response_store.get(prev_id)
+    if stored is None:
+        # Cache miss is non-fatal: codex may have restarted or this id
+        # belongs to a different session. Log and let the request
+        # proceed as-is — the model will see only the deltas, which is
+        # the current (broken) behaviour without the store.
+        logger.warning(
+            f"/v1/responses: previous_response_id={prev_id!r} not in store "
+            "(cache miss) — processing request as-is"
+        )
+        return None, None
+
+    # Build the replayable prior-turn items. Reasoning is dropped.
+    replay_items = _sanitize_stored_input_for_replay(stored.input_items)
+
+    # Current turn input may be a raw string (non-codex client) — in
+    # that case, wrap it as a user message so we can concatenate lists.
+    current_input = request_data.input
+    if isinstance(current_input, str):
+        new_items: List[dict] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": current_input,
+            }
+        ]
+    elif current_input is None:
+        new_items = []
+    else:
+        # Items may be Pydantic models — coerce to dicts for persistence.
+        new_items = [
+            item.model_dump() if hasattr(item, "model_dump") else dict(item)
+            for item in current_input
+        ]
+
+    merged_input = replay_items + new_items
+    merged_instructions = stored.instructions if not request_data.instructions else None
+
+    logger.info(
+        f"/v1/responses: Resume from previous_response_id={prev_id!r} "
+        f"(+{len(new_items)} new items, merged total={len(merged_input)})"
+    )
+    return merged_input, merged_instructions
+
+
+async def _persist_turn(
+    response_store: Optional[ResponseStore],
+    response_id: str,
+    request_data,
+    canonical_input: list,
+    output_items: List[dict],
+) -> None:
+    """
+    Store a completed turn for later ``previous_response_id`` resume.
+
+    Called from both the streaming on_complete callback and the
+    non-streaming JSON path, so the same canonical snapshot lands in
+    the store regardless of mode.
+
+    Args:
+        response_store: App-wide store (may be ``None`` in tests).
+        response_id: Id of the response this turn produced.
+        request_data: The already-merged ``ResponsesRequest`` (so
+            ``input`` is the full reconstructed conversation).
+        canonical_input: Input items used for this turn (what codex
+            would have sent non-delta).
+        output_items: Output items this response produced.
+    """
+    if response_store is None:
+        return
+    try:
+        turn = StoredTurn(
+            input_items=list(canonical_input),
+            output_items=list(output_items),
+            model=request_data.model,
+            instructions=request_data.instructions or None,
+        )
+        await response_store.put(response_id, turn)
+        logger.debug(
+            f"/v1/responses: stored turn {response_id} "
+            f"(input_items={len(canonical_input)}, output_items={len(output_items)})"
+        )
+    except Exception as e:
+        logger.warning(f"/v1/responses: failed to persist turn {response_id}: {e}")
+
+
+def _coerce_input_to_list(request_input) -> List[dict]:
+    """
+    Normalize ``request_data.input`` to a list of dicts for storage.
+
+    Accepts a string (wraps as a user message), a list of dicts or
+    Pydantic models (model_dumps each), or None (returns empty list).
+    """
+    if request_input is None:
+        return []
+    if isinstance(request_input, str):
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": request_input,
+            }
+        ]
+    out: List[dict] = []
+    for item in request_input:
+        if hasattr(item, "model_dump"):
+            out.append(item.model_dump())
+        elif isinstance(item, dict):
+            out.append(dict(item))
+        else:
+            out.append(item)
+    return out
 
 
 @router.get("/")
@@ -559,8 +710,13 @@ async def responses(request: Request):
     This endpoint is used by the OpenAI Agents SDK and other frameworks
     that target the Responses API instead of Chat Completions.
 
-    Note: This is a stateless gateway. Features like previous_response_id
-    with server-side state, store, and metadata are accepted but not used.
+    State for ``previous_response_id``: the gateway maintains an
+    in-memory ``ResponseStore`` so codex's delta protocol works. On turn
+    N>=2, codex sends only new input items (typically
+    ``function_call_output`` items) plus a ``previous_response_id``. The
+    handler looks up the stored canonical conversation, merges it with
+    the new items, then runs the normal Kiro payload build so the model
+    sees the full prior context.
 
     Args:
         request: FastAPI Request for accessing app.state
@@ -589,6 +745,20 @@ async def responses(request: Request):
 
     auth_manager: KiroAuthManager = request.app.state.auth_manager
     model_cache: ModelInfoCache = request.app.state.model_cache
+    response_store: Optional[ResponseStore] = getattr(
+        request.app.state, "response_store", None
+    )
+
+    # --- Resume from previous_response_id (codex delta protocol) ---
+    merged_input_items, merged_instructions = await _resume_from_prev_response(
+        request_data, response_store
+    )
+    # Patch request_data in place so the rest of the handler and the
+    # payload builder see the full reconstructed conversation.
+    if merged_input_items is not None:
+        request_data.input = merged_input_items
+    if merged_instructions is not None and not request_data.instructions:
+        request_data.instructions = merged_instructions
 
     # Generate conversation ID for Kiro API
     conversation_id = generate_conversation_id()
@@ -718,6 +888,20 @@ async def responses(request: Request):
             from kiro.token_stats import UsageCollector
             resp_collector = UsageCollector()
 
+            # Canonical input snapshot for the store — freeze it now so
+            # even if request_data.input gets further mutated later we
+            # persist the exact sequence the model saw on this turn.
+            canonical_input = _coerce_input_to_list(request_data.input)
+
+            async def _on_complete(resp_id: str, final_output: list) -> None:
+                await _persist_turn(
+                    response_store,
+                    resp_id,
+                    request_data,
+                    canonical_input,
+                    final_output,
+                )
+
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
@@ -732,6 +916,7 @@ async def responses(request: Request):
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         usage_collector=resp_collector,
+                        on_complete=_on_complete,
                     ):
                         chunk_count += 1
                         yield chunk
@@ -798,6 +983,18 @@ async def responses(request: Request):
             await http_client.close()
 
             logger.info("HTTP 200 - POST /v1/responses (non-streaming) - completed")
+
+            # Persist into the response store so codex can resume later.
+            try:
+                await _persist_turn(
+                    response_store,
+                    responses_response.get("id", ""),
+                    request_data,
+                    _coerce_input_to_list(request_data.input),
+                    responses_response.get("output", []) or [],
+                )
+            except Exception as store_err:
+                logger.warning(f"Failed to store turn: {store_err}")
 
             # Record token usage
             usage = responses_response.get("usage", {})
@@ -1101,6 +1298,9 @@ async def responses_ws(websocket: WebSocket):
 
     auth_manager: KiroAuthManager = websocket.app.state.auth_manager
     model_cache: ModelInfoCache = websocket.app.state.model_cache
+    response_store: Optional[ResponseStore] = getattr(
+        websocket.app.state, "response_store", None
+    )
     http_client = None
 
     try:
@@ -1139,6 +1339,15 @@ async def responses_ws(websocket: WebSocket):
                     "response": {"error": {"message": f"Invalid request: {e}", "code": "invalid_request"}},
                 }))
                 continue
+
+            # Resume from previous_response_id (codex delta protocol)
+            merged_input_items, merged_instructions = await _resume_from_prev_response(
+                request_data, response_store
+            )
+            if merged_input_items is not None:
+                request_data.input = merged_input_items
+            if merged_instructions is not None and not request_data.instructions:
+                request_data.instructions = merged_instructions
 
             logger.info(
                 f"WebSocket /v1/responses: request (model={request_data.model}, "
@@ -1225,6 +1434,17 @@ async def responses_ws(websocket: WebSocket):
                 from kiro.token_stats import UsageCollector
                 ws_collector = UsageCollector()
 
+                ws_canonical_input = _coerce_input_to_list(request_data.input)
+
+                async def _ws_on_complete(resp_id: str, final_output: list) -> None:
+                    await _persist_turn(
+                        response_store,
+                        resp_id,
+                        request_data,
+                        ws_canonical_input,
+                        final_output,
+                    )
+
                 async for ws_msg in stream_kiro_to_responses_ws(
                     http_client.client,
                     kiro_response,
@@ -1234,6 +1454,7 @@ async def responses_ws(websocket: WebSocket):
                     request_messages=None,
                     request_tools=tools_for_tokenizer,
                     usage_collector=ws_collector,
+                    on_complete=_ws_on_complete,
                 ):
                     await websocket.send_text(ws_msg)
 

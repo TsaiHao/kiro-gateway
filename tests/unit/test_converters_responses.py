@@ -17,6 +17,7 @@ from kiro.converters_responses import (
     convert_responses_input_to_unified,
     convert_responses_tools_to_unified,
     _extract_message_content,
+    _normalize_tool_output,
 )
 from kiro.models_responses import ResponsesRequest
 from kiro.converters_core import UnifiedMessage, UnifiedTool
@@ -444,6 +445,441 @@ class TestConvertResponsesInputToUnified:
 
 
 # ==================================================================================================
+# Tests for _normalize_tool_output
+# ==================================================================================================
+
+
+class TestNormalizeToolOutput:
+    """Tests for the _normalize_tool_output helper."""
+
+    def test_plain_string_passthrough(self):
+        """
+        What it does: String inputs are returned unchanged.
+        Purpose: The common, simple path must not be disturbed.
+        """
+        assert _normalize_tool_output("hello world") == "hello world"
+
+    def test_empty_string_falls_back_to_placeholder(self):
+        """
+        What it does: Empty strings fall back to the "(empty result)" placeholder.
+        Purpose: Preserves the pre-existing fallback contract; Kiro needs non-empty content.
+        """
+        assert _normalize_tool_output("") == "(empty result)"
+
+    def test_none_falls_back_to_placeholder(self):
+        """
+        What it does: None falls back to the "(empty result)" placeholder.
+        Purpose: Handle codex sending output=None for a failed/no-op tool call.
+        """
+        assert _normalize_tool_output(None) == "(empty result)"
+
+    def test_list_of_output_text_blocks_concatenated(self):
+        """
+        What it does: Concatenates text from list-of-output_text blocks.
+        Purpose: Codex sends this shape for large/structured tool outputs
+                 (FunctionCallOutputPayload content_items form).
+        """
+        output = [
+            {"type": "output_text", "text": "line one\n"},
+            {"type": "output_text", "text": "line two"},
+        ]
+        assert _normalize_tool_output(output) == "line one\nline two"
+
+    def test_list_of_mixed_block_types_extracted(self):
+        """
+        What it does: Extracts text from known block types even when intermixed.
+        Purpose: Tolerate slight codex variations (input_text / text / output_text).
+        """
+        output = [
+            {"type": "output_text", "text": "A"},
+            {"type": "text", "text": "B"},
+            {"type": "input_text", "text": "C"},
+        ]
+        assert _normalize_tool_output(output) == "ABC"
+
+    def test_list_with_unknown_blocks_serialized_as_json(self):
+        """
+        What it does: Serializes unknown block shapes as JSON instead of dropping them.
+        Purpose: A forward-compat guarantee so payload changes don't silently lose tool data.
+        """
+        output = [
+            {"type": "output_text", "text": "known "},
+            {"type": "future_block", "payload": {"k": "v"}},
+        ]
+        result = _normalize_tool_output(output)
+        assert result.startswith("known ")
+        # The unknown block is JSON-serialized, not str()-ified with single quotes.
+        assert '"type": "future_block"' in result
+        assert '"payload":' in result
+        assert "'" not in result  # no Python-repr-style single quotes
+
+    def test_list_with_raw_strings(self):
+        """
+        What it does: Accepts raw string elements in the list.
+        Purpose: Some clients may send a list of plain strings.
+        """
+        assert _normalize_tool_output(["foo", "bar"]) == "foobar"
+
+    def test_dict_with_text_field(self):
+        """
+        What it does: Extracts text from a bare dict with a ``text`` field.
+        Purpose: Tolerate codex sending output as a single object rather than a list.
+        """
+        assert _normalize_tool_output({"type": "output_text", "text": "hi"}) == "hi"
+
+    def test_dict_without_text_serialized_as_json(self):
+        """
+        What it does: Falls back to JSON for dicts without a text field.
+        Purpose: Preserve payload instead of producing Python-repr garbage.
+        """
+        result = _normalize_tool_output({"status": "ok", "code": 200})
+        assert '"status": "ok"' in result
+        assert '"code": 200' in result
+
+    def test_list_of_empty_blocks_falls_back(self):
+        """
+        What it does: A list where no block carries any text collapses to the placeholder.
+        Purpose: Avoid emitting empty strings that break downstream Kiro validation.
+        """
+        output = [{"type": "output_text", "text": ""}]
+        assert _normalize_tool_output(output) == "(empty result)"
+
+
+# ==================================================================================================
+# Tests for reasoning item handling (multi-turn bug)
+# ==================================================================================================
+
+
+class TestReasoningItemHandling:
+    """
+    Tests that verify reasoning items from codex are dropped and don't leak into
+    user-visible messages. Relates to the multi-turn "forgets the question" bug.
+    """
+
+    def test_reasoning_item_alone_dropped(self):
+        """
+        What it does: A single ``reasoning`` item is dropped (no message emitted).
+        Purpose: Reasoning is ephemeral model state; replaying it would corrupt the next turn.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "Hello"},
+                {
+                    "type": "reasoning",
+                    "id": "item_abc",
+                    "summary": [],
+                    "content": [
+                        {"type": "reasoning_text", "text": "thinking..."}
+                    ],
+                    "encrypted_content": None,
+                },
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        # Only the user message survives; reasoning item is dropped.
+        assert len(messages) == 1
+        assert messages[0].role == "user"
+        assert messages[0].content == "Hello"
+        # The reasoning text must NOT appear anywhere in unified messages.
+        for msg in messages:
+            assert "thinking..." not in (msg.content or "")
+
+    def test_reasoning_does_not_break_adjacent_messages(self):
+        """
+        What it does: Reasoning items between messages don't break neighbor semantics.
+        Purpose: Dropping reasoning must be surgical, not disruptive.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "Q1"},
+                {
+                    "type": "reasoning",
+                    "id": "r1",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "secret thoughts"}],
+                },
+                {"type": "message", "role": "assistant", "content": "A1"},
+                {
+                    "type": "reasoning",
+                    "id": "r2",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "more secrets"}],
+                },
+                {"type": "message", "role": "user", "content": "Q2"},
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        assert [m.role for m in messages] == ["user", "assistant", "user"]
+        assert [m.content for m in messages] == ["Q1", "A1", "Q2"]
+        for msg in messages:
+            assert "secret" not in (msg.content or "")
+
+    def test_standalone_reasoning_text_item_dropped(self):
+        """
+        What it does: A bare ``reasoning_text`` input item is also dropped.
+        Purpose: Defensive — some clients may emit it outside a ``reasoning`` wrapper.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "reasoning_text", "text": "raw reasoning"},
+                {"type": "message", "role": "user", "content": "Hi"},
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        assert len(messages) == 1
+        assert messages[0].content == "Hi"
+
+    def test_reasoning_summary_text_item_dropped(self):
+        """
+        What it does: A bare ``reasoning_summary_text`` input item is dropped.
+        Purpose: Defensive — older/newer codex variants.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "reasoning_summary_text", "text": "summary"},
+                {"type": "message", "role": "user", "content": "Hi"},
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        assert len(messages) == 1
+        assert messages[0].content == "Hi"
+
+
+# ==================================================================================================
+# Tests for function_call_output with structured content (multi-turn bug)
+# ==================================================================================================
+
+
+class TestFunctionCallOutputStructured:
+    """
+    Tests that verify function_call_output with list-form output is extracted correctly
+    rather than stringified into Python list-repr garbage.
+    """
+
+    def test_function_call_output_string_unchanged(self):
+        """
+        What it does: String output passes through unchanged.
+        Purpose: Ensure the normalization preserves the common path.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "run it"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "hello\nworld",
+                },
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        tr = messages[2].tool_results[0]
+        assert tr["content"] == "hello\nworld"
+
+    def test_function_call_output_list_of_output_text(self):
+        """
+        What it does: List of output_text blocks is concatenated into a string.
+        Purpose: Fix the bug where codex's structured output got stringified as Python list-repr.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "run it"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "output_text", "text": "file1.txt\n"},
+                        {"type": "output_text", "text": "file2.txt"},
+                    ],
+                },
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        tr = messages[2].tool_results[0]
+        assert tr["content"] == "file1.txt\nfile2.txt"
+        # Must NOT be a Python list repr.
+        assert "[{" not in tr["content"]
+        assert "'type'" not in tr["content"]
+
+    def test_function_call_output_mixed_block_types(self):
+        """
+        What it does: Mixed known/unknown block types keeps text and JSON-serializes unknowns.
+        Purpose: Forward compatibility — never silently drop tool data.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "run it"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [
+                        {"type": "output_text", "text": "known "},
+                        {"type": "future_block", "data": {"x": 1}},
+                    ],
+                },
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        tr = messages[2].tool_results[0]
+        assert tr["content"].startswith("known ")
+        # Unknown block JSON-serialized, not Python-repr'd.
+        assert '"type": "future_block"' in tr["content"]
+        assert '"data":' in tr["content"]
+        assert "'" not in tr["content"]
+
+    def test_function_call_output_empty_string_placeholder_unchanged(self):
+        """
+        What it does: Empty-string output still maps to "(empty result)".
+        Purpose: Don't regress the existing placeholder contract.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "run it"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "",
+                },
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+        assert messages[2].tool_results[0]["content"] == "(empty result)"
+
+
+# ==================================================================================================
+# End-to-end multi-turn codex-shape fixture
+# ==================================================================================================
+
+
+class TestCodexMultiTurnFixture:
+    """
+    Integration-flavored test using a fixture that mirrors the real codex replay shape
+    observed in logs: user → reasoning → function_call → function_call_output → user.
+    """
+
+    def test_codex_replay_fixture_produces_clean_sequence(self):
+        """
+        What it does: Asserts the unified message sequence for a realistic codex replay.
+        Purpose: Guards against regressions of both reasoning-leak and list-output bugs.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "List /tmp and /"}
+                    ],
+                },
+                # Reasoning echo from the prior turn — must be silently dropped.
+                {
+                    "type": "reasoning",
+                    "id": "item_reasoning_1",
+                    "summary": [],
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": "I should run ls /tmp first, then ls /.",
+                        }
+                    ],
+                    "encrypted_content": None,
+                },
+                # Assistant's function call from the prior turn.
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_ls_tmp",
+                    "name": "shell",
+                    "arguments": '{"command":"ls /tmp"}',
+                },
+                # Tool result in the structured list form codex uses.
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_ls_tmp",
+                    "output": [
+                        {"type": "output_text", "text": "a.txt\nb.log\n"}
+                    ],
+                },
+                # A follow-up user message in the same turn (rare but legal).
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "continue"}
+                    ],
+                },
+            ],
+        )
+        _, messages = convert_responses_input_to_unified(req)
+
+        # Expected sequence: user, assistant (tool_calls), user (tool_results), user.
+        assert len(messages) == 4
+        assert messages[0].role == "user"
+        assert messages[0].content == "List /tmp and /"
+
+        assert messages[1].role == "assistant"
+        assert messages[1].tool_calls and len(messages[1].tool_calls) == 1
+        assert messages[1].tool_calls[0]["id"] == "call_ls_tmp"
+        assert messages[1].tool_calls[0]["function"]["name"] == "shell"
+
+        assert messages[2].role == "user"
+        assert messages[2].tool_results and len(messages[2].tool_results) == 1
+        assert messages[2].tool_results[0]["tool_use_id"] == "call_ls_tmp"
+        # Structured output extracted to a plain string.
+        assert messages[2].tool_results[0]["content"] == "a.txt\nb.log\n"
+
+        assert messages[3].role == "user"
+        assert messages[3].content == "continue"
+
+        # Reasoning content must NOT leak into any unified message.
+        for msg in messages:
+            content_str = str(msg.content or "")
+            assert "should run ls /tmp first" not in content_str
+            assert "reasoning_text" not in content_str
+            # And no Python list repr leaking through either.
+            assert "[{'type'" not in content_str
+
+
+# ==================================================================================================
 # Tests for convert_responses_tools_to_unified
 # ==================================================================================================
 
@@ -783,3 +1219,145 @@ class TestBuildKiroPayload:
         payload = build_kiro_payload(req, "conv-123", "")
 
         assert "profileArn" not in payload
+
+
+# ==================================================================================================
+# Tests for merged-input shapes (previous_response_id resume)
+# ==================================================================================================
+
+
+class TestMergedInputForResume:
+    """
+    When the route handler merges a stored turn's input with the new
+    delta items (codex's turn-N>=2 shape), the converter must produce
+    a unified message sequence where prior ``function_call`` items and
+    their matching ``function_call_output`` items land in adjacent
+    assistant/user messages.
+    """
+
+    def test_merged_function_call_and_output_pair_up(self):
+        """
+        What it does: Merged input = [user msg, prior function_call,
+            new function_call_output]. Convert and assert the result is
+            [user, assistant-with-tool_calls, user-with-tool_results]
+            and the call_id matches on both sides.
+        Purpose: This is exactly the shape the resume path produces on
+            turn 2. If pairing breaks, the model sees tool output with
+            no matching call.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "list /tmp then /",
+                },
+                {
+                    "type": "function_call",
+                    "id": "item_1",
+                    "call_id": "call_abc",
+                    "name": "bash",
+                    "arguments": '{"cmd":"ls /tmp"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": "file1.txt\nfile2.txt",
+                },
+            ],
+        )
+        system_prompt, messages = convert_responses_input_to_unified(req)
+
+        assert len(messages) == 3
+        assert messages[0].role == "user"
+        assert "list /tmp" in messages[0].content
+
+        # Assistant with a single tool_call.
+        assert messages[1].role == "assistant"
+        assert messages[1].tool_calls is not None
+        assert len(messages[1].tool_calls) == 1
+        assert messages[1].tool_calls[0]["id"] == "call_abc"
+        assert messages[1].tool_calls[0]["function"]["name"] == "bash"
+
+        # User with the matching tool_result.
+        assert messages[2].role == "user"
+        assert messages[2].tool_results is not None
+        assert len(messages[2].tool_results) == 1
+        assert messages[2].tool_results[0]["tool_use_id"] == "call_abc"
+        assert messages[2].tool_results[0]["content"] == "file1.txt\nfile2.txt"
+
+    def test_merged_multi_tool_round(self):
+        """
+        What it does: Merged input covers two tool rounds in the same
+            assistant turn. Converter merges consecutive function_calls
+            into one assistant message and the matching outputs into
+            one user message — this is the expected behavior when the
+            prior turn issued two parallel tool calls.
+        Purpose: Verify the pairing logic holds for multi-call turns
+            that codex assembles when the model issues parallel tools.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user",
+                 "content": "run two commands"},
+                {"type": "function_call", "id": "i1", "call_id": "c1",
+                 "name": "bash", "arguments": '{"cmd":"a"}'},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": "OUT_A"},
+                {"type": "function_call", "id": "i2", "call_id": "c2",
+                 "name": "bash", "arguments": '{"cmd":"b"}'},
+                {"type": "function_call_output", "call_id": "c2",
+                 "output": "OUT_B"},
+            ],
+        )
+        system_prompt, messages = convert_responses_input_to_unified(req)
+
+        # Consecutive function_calls merge into the same assistant msg;
+        # the matching outputs also merge into a single user msg.
+        roles = [m.role for m in messages]
+        assert roles == ["user", "assistant", "user"]
+
+        assert len(messages[1].tool_calls) == 2
+        assert messages[1].tool_calls[0]["id"] == "c1"
+        assert messages[1].tool_calls[1]["id"] == "c2"
+
+        assert len(messages[2].tool_results) == 2
+        tr_ids = {tr["tool_use_id"] for tr in messages[2].tool_results}
+        assert tr_ids == {"c1", "c2"}
+        tr_contents = {tr["content"] for tr in messages[2].tool_results}
+        assert tr_contents == {"OUT_A", "OUT_B"}
+
+    def test_merged_with_reasoning_items_are_dropped(self):
+        """
+        What it does: Merged input contains reasoning items between
+            message and function_call. Convert and assert reasoning is
+            silently dropped (converter already handles this).
+        Purpose: Defense in depth — the replay sanitizer in
+            response_store drops reasoning, but the converter must
+            also be tolerant in case untrusted input reaches it.
+        """
+        req = ResponsesRequest(
+            model="claude-sonnet-4",
+            input=[
+                {"type": "message", "role": "user", "content": "q"},
+                {"type": "reasoning", "id": "r1",
+                 "content": [{"type": "reasoning_text",
+                              "text": "INTERNAL"}]},
+                {"type": "function_call", "id": "i1", "call_id": "c1",
+                 "name": "bash", "arguments": '{"cmd":"x"}'},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": "done"},
+            ],
+        )
+        system_prompt, messages = convert_responses_input_to_unified(req)
+
+        # No assistant message containing "INTERNAL" anywhere.
+        joined = " ".join(
+            str(m.content) for m in messages
+        )
+        assert "INTERNAL" not in joined
+        # Pairing still works around the reasoning item.
+        assert messages[1].tool_calls[0]["id"] == "c1"
+        assert messages[2].tool_results[0]["tool_use_id"] == "c1"
