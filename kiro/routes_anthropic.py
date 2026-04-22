@@ -414,7 +414,10 @@ async def messages(
             )
         
         if request_data.stream:
-            # Streaming mode with first token retry
+            # Streaming mode with first token retry — collect per-model usage for stats
+            from kiro.token_stats import UsageCollector
+            anth_collector = UsageCollector()
+
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
@@ -424,7 +427,7 @@ async def messages(
                         return await http_client.request_with_retry(
                             "POST", url, kiro_payload, stream=True
                         )
-                    
+
                     # Use retry wrapper with initial response
                     async for chunk in stream_with_first_token_retry_anthropic(
                         make_request=make_retry_request,
@@ -435,6 +438,7 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
+                        usage_collector=anth_collector,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -464,6 +468,14 @@ async def messages(
                             debug_logger.flush_on_error(500, str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
+                    # Record token usage
+                    if anth_collector.input_tokens or anth_collector.output_tokens:
+                        try:
+                            request.app.state.token_stats.record(
+                                anth_collector.model, anth_collector.input_tokens, anth_collector.output_tokens
+                            )
+                        except Exception as stats_err:
+                            logger.debug(f"Failed to record token stats: {stats_err}")
             
             return StreamingResponse(
                 stream_wrapper(),
@@ -487,9 +499,21 @@ async def messages(
             )
             
             await http_client.close()
-            
+
             logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
-            
+
+            # Record token usage
+            usage = anthropic_response.get("usage", {})
+            if usage:
+                try:
+                    request.app.state.token_stats.record(
+                        request_data.model,
+                        usage.get("input_tokens", 0),
+                        usage.get("output_tokens", 0),
+                    )
+                except Exception as stats_err:
+                    logger.debug(f"Failed to record token stats: {stats_err}")
+
             if debug_logger:
                 debug_logger.discard_buffers()
             

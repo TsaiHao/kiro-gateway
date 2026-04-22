@@ -415,11 +415,21 @@ async def lifespan(app: FastAPI):
         logger.debug(f"Model aliases configured: {list(MODEL_ALIASES.keys())}")
     if HIDDEN_FROM_LIST:
         logger.debug(f"Models hidden from list: {HIDDEN_FROM_LIST}")
-    
+
+    # Initialize token usage statistics
+    from kiro.token_stats import TokenStats
+    app.state.token_stats = TokenStats()
+    app.state.token_stats.cleanup()
+
     yield
-    
+
     # Graceful shutdown
     logger.info("Shutting down application...")
+    try:
+        app.state.token_stats.close()
+        logger.info("Token stats DB closed")
+    except Exception as e:
+        logger.warning(f"Error closing token stats DB: {e}")
     try:
         await app.state.http_client.aclose()
         logger.info("Shared HTTP client closed")
@@ -464,6 +474,10 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Token usage statistics API
+from kiro.routes_stats import router as stats_router
+app.include_router(stats_router)
 
 
 # --- Uvicorn log config ---

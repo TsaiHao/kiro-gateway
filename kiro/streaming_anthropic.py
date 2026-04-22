@@ -135,7 +135,8 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    usage_collector=None,
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -641,7 +642,10 @@ async def stream_kiro_to_anthropic(
             stop_reason = "tool_use"
         else:
             stop_reason = "end_turn"
-        
+
+        if usage_collector:
+            usage_collector.set(model, input_tokens, output_tokens)
+
         # Send message_delta with stop_reason and usage
         usage_payload = {
             "output_tokens": output_tokens
