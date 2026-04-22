@@ -24,6 +24,8 @@ debug*.json
 # Project-specific
 _notes/
 requests/
+# /v1/models curl dump dropped into repo root
+/models
 
 # Testing
 .pytest_cache/
