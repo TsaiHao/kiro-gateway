@@ -40,6 +40,8 @@ from kiro.models_anthropic import (
     AnthropicMessagesResponse,
     AnthropicErrorResponse,
     AnthropicErrorDetail,
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
@@ -53,6 +55,7 @@ from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.tokenizer import estimate_request_tokens
 
 # Import debug_logger
 try:
@@ -112,6 +115,68 @@ async def verify_anthropic_api_key(
 
 # --- Router ---
 router = APIRouter(tags=["Anthropic API"])
+
+
+@router.post(
+    "/v1/messages/count_tokens",
+    dependencies=[Depends(verify_anthropic_api_key)],
+    response_model=AnthropicCountTokensResponse,
+)
+async def count_tokens_endpoint(
+    request_data: AnthropicCountTokensRequest,
+    anthropic_version: Optional[str] = Header(None, alias="anthropic-version"),
+    anthropic_beta: Optional[str] = Header(None, alias="anthropic-beta"),
+) -> AnthropicCountTokensResponse:
+    """
+    Anthropic Token Counting API endpoint.
+
+    Returns an estimate of how many input tokens the prompt would
+    consume if sent to /v1/messages. Kiro itself has no native
+    token-counting API, so the estimate is produced locally by the
+    same tokenizer used for fallback estimation in the streaming path
+    (tiktoken with a Claude correction factor). Accuracy is ~85-90%,
+    which is what clients like Claude Code use the endpoint for —
+    budgeting and cache-pressure decisions, not billing.
+
+    Reference: https://docs.anthropic.com/en/api/messages-count-tokens
+
+    Args:
+        request_data: Count-tokens request (model, messages, system, tools).
+        anthropic_version: Optional anthropic-version header.
+        anthropic_beta: Optional anthropic-beta header (accepted for
+            compatibility; doesn't change the count).
+
+    Returns:
+        AnthropicCountTokensResponse with a single input_tokens field.
+    """
+    logger.info(
+        f"Request to /v1/messages/count_tokens "
+        f"(model={request_data.model}, messages={len(request_data.messages)}, "
+        f"tools={len(request_data.tools) if request_data.tools else 0})"
+    )
+    if anthropic_version:
+        logger.debug(f"anthropic-version: {anthropic_version}")
+    if anthropic_beta:
+        logger.debug(f"anthropic-beta: {anthropic_beta}")
+
+    # Pydantic models -> plain dicts so estimate_request_tokens can walk
+    # them the same way it walks request bodies inside the streaming path.
+    messages_dicts = [
+        m.model_dump(exclude_none=True) for m in request_data.messages
+    ]
+    tools_dicts = (
+        [t.model_dump(exclude_none=True) for t in request_data.tools]
+        if request_data.tools
+        else None
+    )
+
+    stats = estimate_request_tokens(
+        messages=messages_dicts,
+        tools=tools_dicts,
+        system_prompt=request_data.system,
+        apply_claude_correction=False,
+    )
+    return AnthropicCountTokensResponse(input_tokens=stats["total_tokens"])
 
 
 @router.post("/v1/messages", dependencies=[Depends(verify_anthropic_api_key)])

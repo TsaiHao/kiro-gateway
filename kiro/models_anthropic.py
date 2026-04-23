@@ -340,6 +340,46 @@ class AnthropicMessagesRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class AnthropicCountTokensRequest(BaseModel):
+    """
+    Request to Anthropic Token Counting API (/v1/messages/count_tokens).
+
+    Same shape as AnthropicMessagesRequest minus response-control fields
+    (max_tokens, stream, temperature, etc.). The API just counts how many
+    input tokens the prompt would consume if sent to /v1/messages.
+
+    Reference: https://docs.anthropic.com/en/api/messages-count-tokens
+
+    Attributes:
+        model: Model ID (required — token counts vary slightly by model).
+        messages: Conversation messages (required, non-empty).
+        system: System prompt (string or cache-aware content blocks).
+        tools: Tool definitions.
+        tool_choice: Tool selection strategy.
+        thinking: Extended-thinking config (counted toward input budget).
+    """
+
+    model: str
+    messages: List[AnthropicMessage] = Field(min_length=1)
+    system: Optional[SystemPrompt] = None
+    tools: Optional[List[AnthropicTool]] = None
+    tool_choice: Optional[Union[ToolChoice, Dict[str, Any]]] = None
+    thinking: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "allow"}
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    """
+    Response from Anthropic Token Counting API.
+
+    Attributes:
+        input_tokens: Number of tokens the request would consume as input.
+    """
+
+    input_tokens: int
+
+
 # ==================================================================================================
 # Response Models
 # ==================================================================================================
