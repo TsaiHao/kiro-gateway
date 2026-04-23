@@ -26,6 +26,10 @@ _notes/
 requests/
 # /v1/models curl dump dropped into repo root
 /models
+# kiro-cli toolbox telemetry log dropped into repo root
+/kiro-gateway-log.json
+# codex-cli creates an empty .codex marker file in trusted dirs
+/.codex
 
 # Testing
 .pytest_cache/
